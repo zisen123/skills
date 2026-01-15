@@ -40,6 +40,16 @@
         "./skills/web-artifacts-builder",
         "./skills/webapp-testing"
       ]
+    },
+    {
+      "name": "cli-delegation-skills",
+      "description": "CLI delegation skills for offloading code reading, bug investigation, and codebase search tasks to external AI agents (gemini-cli, cursor-cli) to reduce Claude Code quota consumption",
+      "source": "./",
+      "strict": false,
+      "skills": [
+        "./skills/gemini-cli",
+        "./skills/cursor-cli"
+      ]
     }
   ]
 }
