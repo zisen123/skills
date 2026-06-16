@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>Jira MCP Server</title>
+<style>
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; line-height: 1.6; color: #333; }
+h1 { border-bottom: 2px solid #2684FF; padding-bottom: 10px; }
+h2 { color: #2684FF; margin-top: 2em; }
+code { background: #f4f5f7; padding: 2px 6px; border-radius: 3px; font-size: 0.9em; }
+pre { background: #f4f5f7; padding: 16px; border-radius: 6px; overflow-x: auto; }
+pre code { padding: 0; background: none; }
+table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+th, td { border: 1px solid #dfe1e6; padding: 8px 12px; text-align: left; }
+th { background: #f4f5f7; }
+.note { background: #fffae6; border-left: 4px solid #ffab00; padding: 12px 16px; margin: 1em 0; }
+.diagram { background: #f9f9f9; border: 1px solid #ddd; padding: 16px; font-family: monospace; white-space: pre; line-height: 1.4; }
+</style>
+</head>
+<body>
+
+<h1>Jira MCP Server</h1>
+<p>通过 HTML 页面抓取实现的 Jira MCP Server，让 Claude Code 能够操作 Jira。</p>
+
+<h2>背景</h2>
+<p>公司 Jira（v8.13.11，<code>https://jira.sophgo.com</code>）的 REST API 被完全封锁（rate-limit=0，永久 429）。但 Web 页面正常访问，且是服务端渲染的 HTML，包含完整的结构化数据。</p>
+<p>本项目通过 <strong>Session Cookie 认证 + HTML 解析</strong> 绕过 API 限制，提供 MCP（Model Context Protocol）接口供 Claude Code 调用。</p>
+
+<h2>架构</h2>
+<div class="diagram">
+Claude Code ──stdio──▶ MCP Server (Node.js)
+                            │
+                            ▼
+                      JiraClient
+                        ├── POST /rest/auth/1/session → JSESSIONID
+                        ├── GET  /issues/?jql=...    → 搜索结果 HTML
+                        ├── GET  /browse/KEY-123     → Issue 详情 HTML
+                        └── POST /secure/*.jspa      → 写操作 (带 atl_token)
+                            │
+                            ▼
+                    Cheerio HTML Parser → 结构化数据
+</div>
+
+<h2>涉及文件</h2>
+<table>
+<tr><th>文件</th><th>作用</th></tr>
+<tr><td><code>server.js</code></td><td>MCP 入口：注册工具（tools/list）、分发调用（tools/call），通过 stdio 与 Claude Code 通信</td></tr>
+<tr><td><code>jira-client.js</code></td><td>核心实现：登录、会话/XSRF cookie 管理、HTML 抓取与解析、各操作（search/get/comment/transition/assign/create）</td></tr>
+<tr><td><code>project-id-cache.json</code></td><td>项目 key→pid 缓存（已 gitignore，运行时自动生成/补全）</td></tr>
+<tr><td><code>.mcp.json.example</code></td><td>MCP 配置模板，复制到项目根目录后填入凭据</td></tr>
+<tr><td><code>package.json</code></td><td>依赖声明（<code>@modelcontextprotocol/sdk</code>、<code>cheerio</code>）</td></tr>
+</table>
+
+<h2>认证流程</h2>
+<ol>
+<li>启动时用 username/password 调用 <code>/rest/auth/1/session</code> 获取 JSESSIONID</li>
+<li>后续请求通过 <code>Cookie: JSESSIONID=xxx</code> 认证</li>
+<li>Session 过期（401 或 302 到登录页）时自动重新登录</li>
+<li>写操作从页面提取 <code>atl_token</code> 用于 XSRF 防护；<code>request()</code> 还会自动捕获并回传 <code>atlassian.xsrf.token</code> cookie（创建 issue 等表单提交需要）</li>
+</ol>
+
+<h2>提供的工具</h2>
+<table>
+<tr><th>Tool</th><th>功能</th><th>实现方式</th></tr>
+<tr><td><code>jira_search</code></td><td>JQL 搜索 issue 列表</td><td>GET <code>/issues/?jql=...</code> 解析 splitview HTML</td></tr>
+<tr><td><code>jira_get_issue</code></td><td>获取 issue 详情</td><td>GET <code>/browse/KEY-123</code> 解析页面元素</td></tr>
+<tr><td><code>jira_add_comment</code></td><td>添加评论</td><td>POST <code>/secure/AddComment.jspa</code></td></tr>
+<tr><td><code>jira_transition</code></td><td>转换状态</td><td>POST <code>/secure/WorkflowUIDispatcher.jspa</code></td></tr>
+<tr><td><code>jira_assign</code></td><td>指派人员</td><td>POST <code>/secure/AssignIssue.jspa</code></td></tr>
+<tr><td><code>jira_create_issue</code></td><td>创建 issue</td><td>POST <code>/secure/CreateIssueDetails.jspa</code>（HTML 表单提交）</td></tr>
+</table>
+
+<h2>创建 issue 的实现细节</h2>
+<p>该实例的 REST <code>createmeta</code> 接口同样被封锁，无法用常规方式查询项目 ID（pid）和 issue 类型，因此 <code>jira_create_issue</code> 完全基于 HTML 表单实现，关键点如下：</p>
+<ul>
+<li><strong>pid 反查</strong>：访问 <code>/secure/CreateIssueDetails!init.jspa?pid=N</code>，页面里 description 文本框带有 <code>data-projectkey="KEY"</code> 属性，据此把项目 key（如 <code>CV184XSDK</code>）映射到数字 pid。遍历探测命中后写入磁盘缓存 <code>project-id-cache.json</code>，途经的所有 key→pid 一并缓存，所以全量扫描一辈子只发生一次。</li>
+<li><strong>issue 类型</strong>：内置常见类型名到 id 的映射（故障/Bug=10100、任务/Task=10002、故事=10001、改进=10200、子任务=10103），也可直接传数字 id。</li>
+<li><strong>XSRF 防护</strong>：提交时需同时携带三样东西 —— 请求头 <code>X-Atlassian-Token: no-check</code> + 同 session 的 <code>atlassian.xsrf.token</code> cookie（由 <code>request()</code> 自动捕获并回传）+ 表单里的 <code>atl_token</code>/<code>formToken</code>，缺一不可。</li>
+<li><strong>必填字段</strong>：<code>reporter</code>（报告人）为必填，缺省取登录用户；<code>priority</code> 部分项目必填，缺省取表单默认值（Medium）。</li>
+</ul>
+<div class="note">
+<strong>注意：</strong>pid 与 issue 类型是<strong>实例 / 项目相关</strong>的，不同 Jira 实例的数值不同。<code>project-id-cache.json</code> 已被 gitignore，预置了若干常用项目（如 <code>CV184XSDK=10716</code>、<code>CV180X181X=10414</code>），缺失项目首次创建时会自动探测补全。
+</div>
+
+<h2>使用方法</h2>
+
+<h3>1. 安装依赖</h3>
+<pre><code>cd mcp/jira-mcp-server
+npm install</code></pre>
+
+<h3>2. 配置 MCP Server</h3>
+<p>复制模板到你的项目根目录：</p>
+<pre><code>cp mcp/jira-mcp-server/.mcp.json.example /your/project/.mcp.json</code></pre>
+<p>编辑 <code>.mcp.json</code>，填入实际信息：</p>
+<pre><code>{
+  "mcpServers": {
+    "jira": {
+      "command": "node",
+      "args": ["/absolute/path/to/mcp/jira-mcp-server/server.js"],
+      "env": {
+        "JIRA_URL": "https://jira.sophgo.com",
+        "JIRA_USER": "your_username",
+        "JIRA_PASSWORD": "your_password"
+      }
+    }
+  }
+}</code></pre>
+
+<div class="note">
+<strong>安全提示：</strong><code>.mcp.json</code> 包含密码，务必：
+<ul>
+<li>设置文件权限：<code>chmod 600 .mcp.json</code></li>
+<li>加入 gitignore 防止提交</li>
+</ul>
+</div>
+
+<h3>3. 使用</h3>
+<p>配置好后需<strong>重启 Claude Code</strong>，让它重新加载 MCP server（新增工具同理）。之后在 Claude Code 中直接用自然语言操作 Jira：</p>
+<ul>
+<li>"搜索我最近的未关闭 issue"</li>
+<li>"查看 CV184XSDK-1299 的详情"</li>
+<li>"给 IVA-1114 添加评论：已完成测试"</li>
+<li>"把这个 issue 指派给 zhang.san"</li>
+<li>"在 CV184XSDK 创建一个故障：xxx 编译失败，描述是 ……"</li>
+</ul>
+
+<div class="note">
+<strong>验证 server 是否正常：</strong>不进 Claude Code 也能用一条命令握手测试：
+<pre><code>echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"1.0.0"}}}' \
+  | JIRA_URL=https://jira.sophgo.com JIRA_USER=xxx JIRA_PASSWORD=xxx node server.js</code></pre>
+返回带 <code>serverInfo</code> 的 JSON 即说明启动正常。</div>
+
+<h2>技术栈</h2>
+<ul>
+<li><strong>Runtime:</strong> Node.js（ES Modules）</li>
+<li><strong>MCP SDK:</strong> <code>@modelcontextprotocol/sdk</code></li>
+<li><strong>HTML 解析:</strong> <code>cheerio</code></li>
+<li><strong>传输:</strong> stdio（Claude Code 标准方式）</li>
+</ul>
+
+<h2>已知限制</h2>
+<ul>
+<li>依赖 Jira 页面的 HTML 结构，Jira 升级可能需要更新选择器</li>
+<li>Session 有效期有限（通常几小时），但已实现自动续期</li>
+<li>搜索结果依赖 splitview 或 table 两种页面布局，已做兼容</li>
+<li>创建 issue 时，若目标项目不在 <code>project-id-cache.json</code> 缓存里，首次会遍历探测 pid（约上百次请求），命中后写入缓存，后续即时返回</li>
+</ul>
+
+</body>
+</html>

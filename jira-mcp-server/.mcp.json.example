@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "jira": {
+      "command": "node",
+      "args": ["/path/to/mcp/jira-mcp-server/server.js"],
+      "env": {
+        "JIRA_URL": "https://jira.sophgo.com",
+        "JIRA_USER": "your_username",
+        "JIRA_PASSWORD": "your_password"
+      }
+    }
+  }
+}
